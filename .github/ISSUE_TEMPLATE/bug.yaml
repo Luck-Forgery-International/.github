@@ -1,0 +1,22 @@
+name: 🐞Bug
+description: Create a new bug for any story misbehaving features.
+title: "<Bug Title>"
+type: "Bug"
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      placeholder: Currently, I am unable to... Consequently, it needs to...
+    validations:
+      required: true
+  - type: textarea
+    id: story
+    attributes:
+      label: Linked Stories (if applicable)
+      placeholder: |
+        - [ ] [Feature/#123 - title](link)
+        - [ ] [Task/#456 - title](link)
+        - [ ] [Bug/#789 - title](link)
+    validations:
+      required: false

@@ -1,0 +1,14 @@
+name: 📋Task
+description: Create a new task for any investigation nedded to permit the creation of a new feature or bug fix.
+title: "<Task Title>"
+type: "Task"
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Instructions
+      placeholder: | 
+        - [ ] See if the task is already done, if not, create a new task...
+        - [ ] Gather all the information of tools needed to complete the task...
+    validations:
+      required: true
