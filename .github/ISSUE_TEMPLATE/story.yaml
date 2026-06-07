@@ -1,0 +1,21 @@
+name: Story
+description: Create a new story dedicated to updating current features.
+title: "<Story Title>"
+type: ["Feature"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      placeholder: Currently, I am unable to... Consequently, it needs to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Detail the criteria required for this story to be considered complete.
+      placeholder: |
+        - [ ] As a user, I am able to... so that...
+        - [ ] As a process, I can... such that...
