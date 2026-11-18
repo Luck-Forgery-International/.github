@@ -1,0 +1,79 @@
+# Org-wide security checks. Required on every repo by an organisation ruleset.
+#   gitleaks: blocks merging commits that contain secrets (API keys, tokens, passwords).
+#   zizmor:   audits GitHub Actions workflows for insecure patterns.
+# Both tools are downloaded from their official releases and checked against a pinned
+# SHA-256, so no third-party Actions are needed. Results go to the run log only
+# (no SARIF upload), which keeps this free on private repos.
+name: Security checks
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  ZIZMOR_VERSION: 1.32.0
+  ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+
+jobs:
+  gitleaks:
+    name: gitleaks (secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+
+      - name: Scan commits for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          # PRs and merge queues: only the new commits. Manual runs: full history.
+          if [ -n "$BASE_SHA" ]; then range="$BASE_SHA..$HEAD_SHA"; else range="HEAD"; fi
+          echo "Scanning $range"
+          "$RUNNER_TEMP/gitleaks" git --log-opts="$range" --redact --verbose .
+
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLo zizmor.tar.gz "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
+          tar -xzf zizmor.tar.gz zizmor
+
+      - name: Audit workflows and actions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -d .github/workflows ] || find . -path ./.git -prune -o -name 'action.y*ml' -print | grep -q .; then
+            "$RUNNER_TEMP/zizmor" --format=github .
+          else
+            echo "No workflows or actions in this repo; nothing to audit."
+          fi
