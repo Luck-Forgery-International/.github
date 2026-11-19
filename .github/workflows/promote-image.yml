@@ -116,13 +116,30 @@ jobs:
           push-to-registry: true
           create-storage-record: false  # optional linked-artifacts record; needs extra permission
 
+      # Re-tag through the registry API by re-uploading the exact manifest bytes, so :prod
+      # resolves to the same digest that was attested. (`imagetools create` would wrap it
+      # in a new index with a different digest.)
       - name: Move the :prod tag to this digest
         env:
+          REGISTRY_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.verify.outputs.image }}
           DIGEST: ${{ needs.verify.outputs.digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create --tag "$IMAGE:prod" "$IMAGE@$DIGEST"
+          path="${IMAGE#ghcr.io/}"
+          token="$(curl -fsS -u "$GITHUB_ACTOR:$REGISTRY_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:$path:pull,push" | jq -r .token)"
+          accept="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json"
+          accept="$accept,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          curl -fsS -H "Authorization: Bearer $token" -H "Accept: $accept" \
+            -D "$RUNNER_TEMP/manifest.headers" -o "$RUNNER_TEMP/manifest.json" \
+            "https://ghcr.io/v2/$path/manifests/$DIGEST"
+          ctype="$(grep -i '^content-type:' "$RUNNER_TEMP/manifest.headers" | head -1 | cut -d' ' -f2 | tr -d '\r')"
+          curl -fsS -X PUT -H "Authorization: Bearer $token" -H "Content-Type: $ctype" \
+            --data-binary "@$RUNNER_TEMP/manifest.json" "https://ghcr.io/v2/$path/manifests/prod"
+          now="$(curl -fsS -I -H "Authorization: Bearer $token" -H "Accept: $accept" \
+            "https://ghcr.io/v2/$path/manifests/prod" | grep -i '^docker-content-digest:' | cut -d' ' -f2 | tr -d '\r')"
+          [ "$now" = "$DIGEST" ] || { echo ":prod is $now, expected $DIGEST" >&2; exit 1; }
           echo "Promoted \`$IMAGE@$DIGEST\` to :prod" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of GHCR
