@@ -52,7 +52,6 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"; repo="${repo#.}"; repo="${repo,,}"
@@ -63,7 +62,6 @@ jobs:
             digest="$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r .digest)"
           fi
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid digest: $digest" >&2; exit 1; }
-          docker logout ghcr.io
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
@@ -78,6 +76,10 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY_OWNER/.github/.github/workflows/release-image.yml"
           echo "Verified build provenance for \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
 
   promote:
     name: Approve ${{ inputs.image }} for prod
@@ -98,8 +100,6 @@ jobs:
           DIGEST: ${{ needs.verify.outputs.digest }}
         run: |
           set -euo pipefail
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker-config" >> "$GITHUB_ENV"
-          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           jq -n --arg by "$GITHUB_ACTOR" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg image "$IMAGE@$DIGEST" \

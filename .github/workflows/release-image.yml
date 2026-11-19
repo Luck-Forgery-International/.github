@@ -54,13 +54,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Log in to GHCR (credentials kept in this job's temp dir)
+      # The attest action reads registry credentials only from ~/.docker, so log in there
+      # and always log out at the end (matters on self-hosted runners).
+      - name: Log in to GHCR
         env:
           REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker-config" >> "$GITHUB_ENV"
-          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
-          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Build and push
         id: build
