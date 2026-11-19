@@ -1,0 +1,107 @@
+# Reusable: build one container image, push it to GHCR, and attest its build provenance.
+# App repos call this from their release.yml, once per image (e.g. web and api).
+# The image is pushed as ghcr.io/<org>/<repo>/<image>; deploy it by the digest this outputs.
+name: Release image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Short image name, e.g. web or api.
+        type: string
+        required: true
+      context:
+        description: Build context directory containing the Dockerfile.
+        type: string
+        required: true
+      tag:
+        description: Human-readable tag, usually the release tag. Deployments use the digest, not this.
+        type: string
+        required: true
+      platforms:
+        description: Target platforms. The Pis are linux/arm64.
+        type: string
+        default: linux/arm64
+      runner:
+        description: JSON for runs-on. Defaults to the UAT Pi 5 runner.
+        type: string
+        default: '["self-hosted", "uat"]'
+    outputs:
+      image:
+        description: Full image name without tag.
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: sha256 digest of the pushed image.
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build ${{ inputs.image }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write      # push to GHCR
+      id-token: write      # sign the attestation
+      attestations: write  # store the attestation
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The attest action reads registry credentials only from ~/.docker, so log in there
+      # and always log out at the end (matters on self-hosted runners).
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        id: build
+        env:
+          IMAGE_NAME: ${{ inputs.image }}
+          BUILD_CONTEXT: ${{ inputs.context }}
+          IMAGE_TAG: ${{ inputs.tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"; repo="${repo#.}"; repo="${repo,,}"
+          image="ghcr.io/$owner/$repo/${IMAGE_NAME,,}"
+          tag="$(printf '%s' "$IMAGE_TAG" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-128)"
+
+          docker buildx build "$BUILD_CONTEXT" \
+            --platform "$PLATFORMS" \
+            --tag "$image:$tag" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false \
+            --metadata-file "$RUNNER_TEMP/build-meta.json" \
+            --push
+
+          digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/build-meta.json")"
+          if [ -z "$digest" ]; then
+            digest="$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Could not determine image digest" >&2; exit 1; }
+
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$image@$digest\` (tag \`$tag\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.build.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false  # optional linked-artifacts record; needs extra permission
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true

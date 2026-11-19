@@ -1,0 +1,130 @@
+# Reusable: approve one released image for production.
+#   1. verify: resolves the digest and checks it has build provenance signed by release-image.yml.
+#   2. promote: waits for approval on the caller repo's `production` environment, then signs an
+#      "approved for prod" attestation for that digest and moves the :prod tag to it.
+# The prod Pi's pull agent only runs :prod if both attestations verify.
+name: Promote image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Short image name, e.g. web or api (same as in release-image.yml).
+        type: string
+        required: true
+      tag:
+        description: Release tag to promote. Ignored if digest is given.
+        type: string
+        default: ''
+      digest:
+        description: sha256 digest to promote.
+        type: string
+        default: ''
+      runner:
+        description: JSON for runs-on.
+        type: string
+        default: '"ubuntu-latest"'
+
+permissions: {}
+
+env:
+  APPROVAL_PREDICATE: https://github.com/Luck-Forgery-International/.github/approved-for-prod/v1
+
+jobs:
+  verify:
+    name: Verify ${{ inputs.image }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      digest: ${{ steps.resolve.outputs.digest }}
+    steps:
+      - name: Resolve image digest
+        id: resolve
+        env:
+          IMAGE_NAME: ${{ inputs.image }}
+          IMAGE_TAG: ${{ inputs.tag }}
+          IMAGE_DIGEST: ${{ inputs.digest }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"; repo="${repo#.}"; repo="${repo,,}"
+          image="ghcr.io/$owner/$repo/${IMAGE_NAME,,}"
+          digest="$IMAGE_DIGEST"
+          if [ -z "$digest" ]; then
+            [ -n "$IMAGE_TAG" ] || { echo "Give a tag or a digest" >&2; exit 1; }
+            digest="$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r .digest)"
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid digest: $digest" >&2; exit 1; }
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY_OWNER/.github/.github/workflows/release-image.yml"
+          echo "Verified build provenance for \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
+
+  promote:
+    name: Approve ${{ inputs.image }} for prod
+    needs: verify
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment: production   # pauses here until a required reviewer approves
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write      # move the :prod tag, store the attestation
+      id-token: write      # sign the attestation
+      attestations: write
+    steps:
+      - name: Log in to GHCR and write the approval record
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify.outputs.image }}
+          DIGEST: ${{ needs.verify.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          jq -n --arg by "$GITHUB_ACTOR" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg image "$IMAGE@$DIGEST" \
+            '{approvedBy: $by, approvedAt: $at, run: $run, image: $image, environment: "production"}' \
+            > "$RUNNER_TEMP/approval.json"
+
+      - name: Sign "approved for prod"
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.verify.outputs.image }}
+          subject-digest: ${{ needs.verify.outputs.digest }}
+          predicate-type: ${{ env.APPROVAL_PREDICATE }}
+          predicate-path: ${{ runner.temp }}/approval.json
+          push-to-registry: true
+          create-storage-record: false  # optional linked-artifacts record; needs extra permission
+
+      - name: Move the :prod tag to this digest
+        env:
+          IMAGE: ${{ needs.verify.outputs.image }}
+          DIGEST: ${{ needs.verify.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE:prod" "$IMAGE@$DIGEST"
+          echo "Promoted \`$IMAGE@$DIGEST\` to :prod" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
