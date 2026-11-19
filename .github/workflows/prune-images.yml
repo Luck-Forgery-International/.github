@@ -1,0 +1,98 @@
+# Reusable: keep a sliding window of recent images in GHCR and delete the rest.
+# For each image of the calling repo (ghcr.io/<org>/<repo>/<image>) it keeps:
+#   - whatever :prod points to (never deleted)
+#   - the newest `keep` release versions (any tag that isn't prod, a preview or an attestation)
+#   - the attestation entries (sha256-<digest> tags) belonging to kept images
+# and deletes older releases, previews older than `preview-days`, and the attestation
+# entries of deleted images. Untagged versions are only reported, never deleted.
+# Archive anything you must keep (image + attestations) before it falls out of the window.
+name: Prune images
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: Space-separated short image names, e.g. "web api".
+        type: string
+        required: true
+      keep:
+        description: Number of most recent releases to keep per image (plus :prod).
+        type: number
+        default: 5
+      preview-prefix:
+        description: Tag prefix of preview images.
+        type: string
+        default: pr-
+      preview-days:
+        description: Delete preview images older than this many days.
+        type: number
+        default: 7
+      dry-run:
+        description: Only print what would be deleted.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  prune:
+    name: Prune ${{ inputs.images }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write   # list and delete package versions
+    steps:
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES: ${{ inputs.images }}
+          KEEP: ${{ inputs.keep }}
+          PREVIEW_PREFIX: ${{ inputs.preview-prefix }}
+          PREVIEW_DAYS: ${{ inputs.preview-days }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          org="$GITHUB_REPOSITORY_OWNER"
+          repo="${GITHUB_REPOSITORY#*/}"; repo="${repo#.}"; repo="${repo,,}"
+          [ "$DRY_RUN" = true ] && echo "DRY RUN: nothing will be deleted." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          for name in $IMAGES; do
+            [[ "$name" =~ ^[a-z0-9._-]+$ ]] || { echo "Invalid image name: $name" >&2; exit 1; }
+            pkg="$repo/$name"; enc="${pkg//\//%2F}"
+            echo "::group::$pkg"
+            if ! versions="$(gh api --paginate "orgs/$org/packages/container/$enc/versions?per_page=100" 2>/dev/null | jq -s 'add')"; then
+              echo "Package $pkg not found; nothing to prune."; echo "::endgroup::"; continue
+            fi
+
+            plan="$(jq --argjson keep "$KEEP" --arg pre "$PREVIEW_PREFIX" --argjson pdays "$PREVIEW_DAYS" \
+                        --argjson now "$(date -u +%s)" '
+              map(. + {tags: (.metadata.container.tags // [])}) as $v
+              | def is_att: startswith("sha256-");
+              ($v | map(select(.tags | index("prod"))) | map(.name)) as $prod
+              | ($v | map(select(any(.tags[]; . != "prod" and (is_att | not) and (startswith($pre) | not))))
+                    | sort_by(.created_at) | reverse) as $rel
+              | (($prod + ($rel[:$keep] | map(.name))) | unique) as $kept
+              | ($rel[$keep:] | map(select(.name as $n | $kept | index($n) | not))) as $oldrel
+              | ($v | map(select(any(.tags[]; startswith($pre)))
+                    | select(.name as $n | $kept | index($n) | not)
+                    | select(($now - (.created_at | sub("\\.[0-9]+"; "") | fromdateiso8601)) > ($pdays * 86400)))) as $oldprev
+              | (($oldrel + $oldprev) | map(.name)) as $gone
+              | ($v | map(select((.tags | length) > 0 and all(.tags[]; is_att))
+                    | select(any(.tags[]; ("sha256:" + (ltrimstr("sha256-") | .[0:64])) as $d | $gone | index($d))))) as $oldatt
+              | { kept: $kept,
+                  delete: (($oldrel + $oldprev + $oldatt) | unique_by(.id) | map({id, name, tags})),
+                  untagged: ($v | map(select((.tags | length) == 0)) | length),
+                  total: ($v | length) }' <<<"$versions")"
+
+            echo "Versions: $(jq .total <<<"$plan"), untagged (left alone): $(jq .untagged <<<"$plan")"
+            echo "Keeping:"; jq -r '.kept[] | "  \(.)"' <<<"$plan"
+            echo "Deleting:"; jq -r '.delete[] | "  \(.id)  \(.name)  [\(.tags | join(", "))]"' <<<"$plan"
+            echo "- \`$pkg\`: keep $(jq '.kept | length' <<<"$plan") image(s), delete $(jq '.delete | length' <<<"$plan") version(s)" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$DRY_RUN" != true ]; then
+              for id in $(jq -r '.delete[].id' <<<"$plan"); do
+                gh api -X DELETE "orgs/$org/packages/container/$enc/versions/$id" && echo "deleted $id"
+              done
+            fi
+            echo "::endgroup::"
+          done
