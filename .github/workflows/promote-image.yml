@@ -114,6 +114,7 @@ jobs:
           predicate-type: ${{ env.APPROVAL_PREDICATE }}
           predicate-path: ${{ runner.temp }}/approval.json
           push-to-registry: true
+          create-storage-record: false  # optional linked-artifacts record; needs extra permission
 
       - name: Move the :prod tag to this digest
         env:
