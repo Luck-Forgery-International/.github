@@ -98,12 +98,15 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.verify.outputs.image }}
           DIGEST: ${{ needs.verify.outputs.digest }}
+          # Release version, so the prod pull agent can refuse to roll back to a lower one.
+          # Empty when promoting by digest only.
+          VERSION: ${{ inputs.digest == '' && inputs.tag || '' }}
         run: |
           set -euo pipefail
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           jq -n --arg by "$GITHUB_ACTOR" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg image "$IMAGE@$DIGEST" \
-            '{approvedBy: $by, approvedAt: $at, run: $run, image: $image, environment: "production"}' \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg image "$IMAGE@$DIGEST" --arg version "$VERSION" \
+            '{approvedBy: $by, approvedAt: $at, run: $run, image: $image, version: $version, environment: "production"}' \
             > "$RUNNER_TEMP/approval.json"
 
       - name: Sign "approved for prod"
