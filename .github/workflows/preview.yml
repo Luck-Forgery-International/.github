@@ -11,8 +11,8 @@
 # Port: 10000 + app-number*100 + (PR number mod 100), so each app owns a block of 100.
 # The app's Compose file reads ${PREVIEW_PORT} (publish it on one service only) and
 # ${DATABASE_URL} (give it only to the service that needs the database). Every service
-# needs cpus and mem_limit; no host mounts, sockets, privileges or host namespaces. The
-# workflow checks these rules before building and refuses a file that breaks them.
+# needs cpus, mem_limit, read_only and a non-root user; no host mounts, sockets,
+# privileges or host namespaces. The workflow refuses a file that breaks these rules.
 # Images stay on the dev runner; nothing is pushed to a registry.
 #
 # The runner supplies PREVIEW_DB_HOST, PREVIEW_DB_PORT, PREVIEW_DB_ADMIN_USER and
@@ -82,7 +82,7 @@ jobs:
       - name: Check the preview Compose file
         # Refuse anything that could reach the host: sockets and host mounts, privileged
         # or extra capabilities, host namespaces, ports other than PREVIEW_PORT, missing
-        # CPU or memory limits. Warn about writable root filesystems.
+        # CPU or memory limits, writable root filesystems. (Root users: after the build.)
         env:
           PREVIEW_PORT: ${{ steps.names.outputs.port }}
         run: |
@@ -106,6 +106,7 @@ jobs:
                 ( select(($s.security_opt // []) | map(tostring | test("unconfined|apparmor|seccomp|label|systempaths")) | any)
                     | "\($n): security_opt \($s.security_opt | join(", "))" ),
                 ( select(($s.build.network // "") == "host") | "\($n): builds with the host network" ),
+                ( select(($s.read_only // false) != true) | "\($n): root filesystem is writable (set read_only: true, with tmpfs where it must write)" ),
                 ( select(lim($s.cpus; $s.deploy.resources.limits.cpus) == null) | "\($n): no CPU limit (set cpus)" ),
                 ( select(lim($s.mem_limit; $s.deploy.resources.limits.memory) == null) | "\($n): no memory limit (set mem_limit)" ),
                 ( ($s.ports // [])[] | select((.published // "" | tostring) != $port)
@@ -117,9 +118,6 @@ jobs:
                 | select(.value.driver_opts != null or ((.value.driver // "local") != "local") or (.value.external // false))
                 | "volume \(.key): custom driver, driver options or external (could reach host paths)" ]
             | .[]' <<<"$cfg")"
-          warnings="$(jq -r '.services // {} | to_entries[] | select((.value.read_only // false) != true)
-            | "\(.key): root filesystem is writable (set read_only: true and tmpfs where needed)"' <<<"$cfg")"
-          [ -z "$warnings" ] || while IFS= read -r w; do echo "::warning title=Preview Compose file::$w"; done <<<"$warnings"
           if [ -n "$problems" ]; then
             while IFS= read -r p; do echo "::error title=Preview Compose file::$p"; done <<<"$problems"
             echo "Refusing to deploy: $COMPOSE_FILE_PATH breaks the preview rules (see errors above)." >&2
@@ -158,24 +156,47 @@ jobs:
           DATABASE_URL: ${{ steps.db.outputs.url }}
         run: |
           set -euo pipefail
-          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" build --pull
-          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" up -d --remove-orphans --force-recreate
-          sleep 5
-          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps
-          bad="$(docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps -a --format '{{.Service}} {{.State}}' | awk '$2 != "running"')"
-          if [ -n "$bad" ]; then
-            echo "Not running: $bad" >&2
-            docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" logs --tail 50 >&2 || true
+          dc() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" "$@"; }
+          dc build --pull
+          dc pull --ignore-buildable --quiet
+          # Refuse root before starting anything: the service's user:, or else the image's default.
+          root=""
+          while IFS='|' read -r svc user image; do
+            [ -n "$user" ] || user="$(docker image inspect --format '{{.Config.User}}' "$image")"
+            case "$user" in ""|root|0|0:*|root:*) root="$root $svc";; esac
+          done < <(dc config --format json | jq -r --arg p "$PROJECT" \
+            '.services | to_entries[] | [.key, (.value.user // ""), (.value.image // "\($p)-\(.key)")] | join("|")')
+          if [ -n "$root" ]; then
+            for s in $root; do echo "::error title=Preview Compose file::$s runs as root (set user: or use a non-root image)"; done
+            echo "Refusing to start: no preview container may run as root." >&2
             exit 1
           fi
-          # Warn about containers running as root (the image's default user counts).
-          for c in $(docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps -q); do
-            u="$(docker inspect --format '{{.Config.User}}' "$c")"
-            case "$u" in ""|root|0|0:*|root:*)
-              echo "::warning title=Preview Compose file::$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c") runs as root (set user: or use a non-root image)";;
-            esac
-          done
+          dc up -d --remove-orphans --force-recreate
+          sleep 5
+          dc ps
+          bad="$(dc ps -a --format '{{.Service}} {{.State}}' | awk '$2 != "running"')"
+          if [ -n "$bad" ]; then
+            echo "Not running: $bad" >&2
+            dc logs --tail 50 >&2 || true
+            exit 1
+          fi
           docker image prune -f >/dev/null || true
+
+      - name: Record the preview on the runner host
+        # An empty labelled volume: lets the dev Pi's daily reaper ask GitHub whether this
+        # PR is still open, and clean up (stack, database, deployment) if a teardown was
+        # missed. Removed with the rest of the project on close.
+        env:
+          PROJECT: ${{ steps.names.outputs.project }}
+          DB: ${{ steps.names.outputs.db }}
+          ENVIRONMENT: ${{ steps.names.outputs.environment }}
+        run: |
+          set -euo pipefail
+          docker volume inspect "preview-meta-$PROJECT" >/dev/null 2>&1 || docker volume create \
+            --label "com.docker.compose.project=$PROJECT" --label homelab.preview=1 \
+            --label "homelab.preview.repo=$GITHUB_REPOSITORY" --label "homelab.preview.pr=$PR_NUMBER" \
+            --label "homelab.preview.db=$DB" --label "homelab.preview.environment=$ENVIRONMENT" \
+            "preview-meta-$PROJECT" >/dev/null
 
       - name: Post deployment
         env:
