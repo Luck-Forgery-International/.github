@@ -10,8 +10,9 @@
 #
 # Port: 10000 + app-number*100 + (PR number mod 100), so each app owns a block of 100.
 # The app's Compose file reads ${PREVIEW_PORT} (publish it on one service only) and
-# ${DATABASE_URL} (give it only to the service that needs the database). Build contexts
-# only: bind mounts from the checkout don't exist on the host that runs the containers.
+# ${DATABASE_URL} (give it only to the service that needs the database). Every service
+# needs cpus and mem_limit; no host mounts, sockets, privileges or host namespaces. The
+# workflow checks these rules before building and refuses a file that breaks them.
 # Images stay on the dev runner; nothing is pushed to a registry.
 #
 # The runner supplies PREVIEW_DB_HOST, PREVIEW_DB_PORT, PREVIEW_DB_ADMIN_USER and
@@ -78,6 +79,54 @@ jobs:
             echo "environment=preview-pr-${PR_NUMBER}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Check the preview Compose file
+        # Refuse anything that could reach the host: sockets and host mounts, privileged
+        # or extra capabilities, host namespaces, ports other than PREVIEW_PORT, missing
+        # CPU or memory limits. Warn about writable root filesystems.
+        env:
+          PREVIEW_PORT: ${{ steps.names.outputs.port }}
+        run: |
+          set -euo pipefail
+          # Resolve the file exactly as Compose will run it. Placeholder values only: the real
+          # database URL doesn't exist yet and never appears in this step.
+          cfg="$(PREVIEW_PORT="$PREVIEW_PORT" DATABASE_URL=postgresql://check@localhost/check \
+            docker compose -f "$COMPOSE_FILE_PATH" config --format json)"
+          problems="$(jq -r --arg port "$PREVIEW_PORT" '
+            def lim($a; $b): ($a // $b // null);
+            [ (.services // {} | to_entries[]) as {key: $n, value: $s}
+              | ( ($s.volumes // [])[] | select(.type != "volume" and .type != "tmpfs")
+                    | "\($n): mounts \(.source // .target) from the host (\(.type)); use a named volume or tmpfs" ),
+                ( select($s.privileged == true) | "\($n): privileged" ),
+                ( select(($s.cap_add // []) | length > 0) | "\($n): cap_add \($s.cap_add | join(", "))" ),
+                ( select(($s.devices // []) | length > 0) | "\($n): devices" ),
+                ( select(($s.volumes_from // []) | length > 0) | "\($n): volumes_from" ),
+                ( ("network_mode", "pid", "ipc", "uts", "userns_mode", "cgroup") as $k
+                    | select(($s[$k] // "") | tostring | test("^(host|container:|service:)"))
+                    | "\($n): \($k) \($s[$k])" ),
+                ( select(($s.security_opt // []) | map(tostring | test("unconfined|apparmor|seccomp|label|systempaths")) | any)
+                    | "\($n): security_opt \($s.security_opt | join(", "))" ),
+                ( select(($s.build.network // "") == "host") | "\($n): builds with the host network" ),
+                ( select(lim($s.cpus; $s.deploy.resources.limits.cpus) == null) | "\($n): no CPU limit (set cpus)" ),
+                ( select(lim($s.mem_limit; $s.deploy.resources.limits.memory) == null) | "\($n): no memory limit (set mem_limit)" ),
+                ( ($s.ports // [])[] | select((.published // "" | tostring) != $port)
+                    | "\($n): publishes port \(.published // "random") (only ${PREVIEW_PORT} is allowed)" )
+            ]
+            + ( [ .services // {} | to_entries[] | select((.value.ports // []) | length > 0) | .key ]
+                | if length > 1 then ["more than one service publishes a port: \(join(", "))"] else [] end )
+            + [ (.volumes // {}) | to_entries[]
+                | select(.value.driver_opts != null or ((.value.driver // "local") != "local") or (.value.external // false))
+                | "volume \(.key): custom driver, driver options or external (could reach host paths)" ]
+            | .[]' <<<"$cfg")"
+          warnings="$(jq -r '.services // {} | to_entries[] | select((.value.read_only // false) != true)
+            | "\(.key): root filesystem is writable (set read_only: true and tmpfs where needed)"' <<<"$cfg")"
+          [ -z "$warnings" ] || while IFS= read -r w; do echo "::warning title=Preview Compose file::$w"; done <<<"$warnings"
+          if [ -n "$problems" ]; then
+            while IFS= read -r p; do echo "::error title=Preview Compose file::$p"; done <<<"$problems"
+            echo "Refusing to deploy: $COMPOSE_FILE_PATH breaks the preview rules (see errors above)." >&2
+            exit 1
+          fi
+          echo "$COMPOSE_FILE_PATH passes the preview rules."
+
       - name: Database for this PR
         id: db
         env:
@@ -119,6 +168,13 @@ jobs:
             docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" logs --tail 50 >&2 || true
             exit 1
           fi
+          # Warn about containers running as root (the image's default user counts).
+          for c in $(docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps -q); do
+            u="$(docker inspect --format '{{.Config.User}}' "$c")"
+            case "$u" in ""|root|0|0:*|root:*)
+              echo "::warning title=Preview Compose file::$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c") runs as root (set user: or use a non-root image)";;
+            esac
+          done
           docker image prune -f >/dev/null || true
 
       - name: Post deployment
@@ -161,7 +217,7 @@ jobs:
           echo "db=${slug}_pr_${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "environment=preview-pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           f="label=com.docker.compose.project=$project"
-          ids="$(docker ps -aq --filter "$f")";            [ -z "$ids" ] || docker rm -f $ids
+          ids="$(docker ps -aq --filter "$f")";            [ -z "$ids" ] || docker rm -f -v $ids  # -v: unnamed volumes too
           ids="$(docker network ls -q --filter "$f")";     [ -z "$ids" ] || docker network rm $ids
           ids="$(docker volume ls -q --filter "$f")";      [ -z "$ids" ] || docker volume rm $ids
           # Compose names built images <project>-<service>.
