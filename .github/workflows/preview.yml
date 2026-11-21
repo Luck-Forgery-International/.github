@@ -1,0 +1,200 @@
+# Reusable: a live preview of each pull request on the dev runner, reachable only over
+# the organisation's private network. App repos call this from their preview.yml on
+# pull_request opened / synchronize / reopened / closed.
+#
+# Open or update: builds the app's preview Compose file on the dev runner, gives the PR
+# its own empty database and role (<app>_pr_<N>), starts the stack on its fixed port and
+# posts a GitHub deployment, so the PR shows "View deployment".
+# Close: removes the stack, its images and volumes, drops the database and role, and
+# marks the deployment inactive.
+#
+# Port: 10000 + app-number*100 + (PR number mod 100), so each app owns a block of 100.
+# The app's Compose file reads ${PREVIEW_PORT} (publish it on one service only) and
+# ${DATABASE_URL} (give it only to the service that needs the database). Build contexts
+# only: bind mounts from the checkout don't exist on the host that runs the containers.
+# Images stay on the dev runner; nothing is pushed to a registry.
+#
+# The runner supplies PREVIEW_DB_HOST, PREVIEW_DB_PORT, PREVIEW_DB_ADMIN_USER and
+# PREVIEW_DB_ADMIN_PASSWORD (a role that can only create and drop preview databases).
+name: Preview
+
+on:
+  workflow_call:
+    inputs:
+      app-number:
+        description: The app's number (1-99) from the infra app registry. Fixes its port block.
+        type: number
+        required: true
+      preview-host:
+        description: Host name the preview is reached at (e.g. the dev runner's private DNS name).
+        type: string
+        required: true
+      compose-file:
+        description: Compose file for previews, relative to the repo root.
+        type: string
+        default: compose.preview.yaml
+      runner:
+        description: JSON for runs-on. Defaults to the dev Pi 5 runner.
+        type: string
+        default: '["self-hosted", "dev"]'
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy preview
+    if: github.event.action != 'closed'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      APP_NUMBER: ${{ inputs.app-number }}
+      PREVIEW_HOST: ${{ inputs.preview-host }}
+      COMPOSE_FILE_PATH: ${{ inputs.compose-file }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Work out names and port
+        id: names
+        run: |
+          set -euo pipefail
+          [[ "$APP_NUMBER" =~ ^[0-9]+$ ]] && [ "$APP_NUMBER" -ge 1 ] && [ "$APP_NUMBER" -le 99 ] \
+            || { echo "app-number must be 1-99" >&2; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "not a pull request" >&2; exit 1; }
+          [ -f "$COMPOSE_FILE_PATH" ] || { echo "No $COMPOSE_FILE_PATH in this repo" >&2; exit 1; }
+          repo="${GITHUB_REPOSITORY#*/}"; repo="${repo,,}"
+          slug="$(printf '%s' "$repo" | tr -c 'a-z0-9' '_' | sed -E 's/_+/_/g; s/^_+//; s/_+$//' | cut -c1-40)"
+          {
+            echo "db=${slug}_pr_${PR_NUMBER}"
+            echo "project=preview-${slug//_/-}-pr-${PR_NUMBER}"
+            echo "port=$((10000 + APP_NUMBER * 100 + PR_NUMBER % 100))"
+            echo "environment=preview-pr-${PR_NUMBER}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Database for this PR
+        id: db
+        env:
+          DB: ${{ steps.names.outputs.db }}
+        run: |
+          set -euo pipefail
+          : "${PREVIEW_DB_HOST:?the runner has no preview database settings}"
+          pw="$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 32)"
+          echo "::add-mask::$pw"
+          # psql runs in a throwaway container next to the stack; the password goes in
+          # through the environment and stdin, never on a command line.
+          export PGPASSWORD="$PREVIEW_DB_ADMIN_PASSWORD"
+          { printf '\\set db %s\n\\set pw %s\n' "$DB" "$pw"; cat <<'SQL'
+          SELECT format('CREATE ROLE %I LOGIN IN ROLE preview_dbs', :'db')
+            WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'db') \gexec
+          SELECT format('ALTER ROLE %I CONNECTION LIMIT 10 PASSWORD %L', :'db', :'pw') \gexec
+          SELECT format('CREATE DATABASE %I OWNER %I CONNECTION LIMIT 10', :'db', :'db')
+            WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db') \gexec
+          SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db') \gexec
+          SQL
+          } | docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
+                psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
+          echo "url=postgresql://${DB}:${pw}@${PREVIEW_DB_HOST}:${PREVIEW_DB_PORT}/${DB}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and start
+        env:
+          PROJECT: ${{ steps.names.outputs.project }}
+          PREVIEW_PORT: ${{ steps.names.outputs.port }}
+          DATABASE_URL: ${{ steps.db.outputs.url }}
+        run: |
+          set -euo pipefail
+          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" build --pull
+          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" up -d --remove-orphans --force-recreate
+          sleep 5
+          docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps
+          bad="$(docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" ps -a --format '{{.Service}} {{.State}}' | awk '$2 != "running"')"
+          if [ -n "$bad" ]; then
+            echo "Not running: $bad" >&2
+            docker compose -p "$PROJECT" -f "$COMPOSE_FILE_PATH" logs --tail 50 >&2 || true
+            exit 1
+          fi
+          docker image prune -f >/dev/null || true
+
+      - name: Post deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVIRONMENT: ${{ steps.names.outputs.environment }}
+          PREVIEW_PORT: ${{ steps.names.outputs.port }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          gh_api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                       -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+          url="http://$PREVIEW_HOST:$PREVIEW_PORT"
+          body="$(jq -nc --arg ref "$HEAD_SHA" --arg env "$ENVIRONMENT" \
+            '{ref:$ref, environment:$env, auto_merge:false, required_contexts:[], transient_environment:true, production_environment:false, description:"PR preview on the dev runner"}')"
+          id="$(gh_api -X POST "$api/deployments" -d "$body" | jq -r .id)"
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "Could not create the deployment" >&2; exit 1; }
+          gh_api -X POST "$api/deployments/$id/statuses" \
+            -d "$(jq -nc --arg u "$url" '{state:"success", environment_url:$u, auto_inactive:true, description:"Private network only"}')" >/dev/null
+          echo "Preview: $url (private network only)" >> "$GITHUB_STEP_SUMMARY"
+
+  teardown:
+    name: Remove preview
+    if: github.event.action == 'closed'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    permissions:
+      deployments: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Remove containers, images and volumes
+        id: names
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "not a pull request" >&2; exit 1; }
+          repo="${GITHUB_REPOSITORY#*/}"; repo="${repo,,}"
+          slug="$(printf '%s' "$repo" | tr -c 'a-z0-9' '_' | sed -E 's/_+/_/g; s/^_+//; s/_+$//' | cut -c1-40)"
+          project="preview-${slug//_/-}-pr-${PR_NUMBER}"
+          echo "db=${slug}_pr_${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "environment=preview-pr-${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          f="label=com.docker.compose.project=$project"
+          ids="$(docker ps -aq --filter "$f")";            [ -z "$ids" ] || docker rm -f $ids
+          ids="$(docker network ls -q --filter "$f")";     [ -z "$ids" ] || docker network rm $ids
+          ids="$(docker volume ls -q --filter "$f")";      [ -z "$ids" ] || docker volume rm $ids
+          # Compose names built images <project>-<service>.
+          ids="$( { docker image ls -q --filter "$f"
+                    docker image ls --format '{{.Repository}} {{.ID}}' | awk -v p="$project-" 'index($1, p) == 1 || index($1, "localhost/" p) == 1 {print $2}'
+                  } | sort -u)"
+          [ -z "$ids" ] || docker image rm -f $ids
+          echo "Removed $project"
+
+      - name: Drop the PR database
+        env:
+          DB: ${{ steps.names.outputs.db }}
+        run: |
+          set -euo pipefail
+          : "${PREVIEW_DB_HOST:?the runner has no preview database settings}"
+          export PGPASSWORD="$PREVIEW_DB_ADMIN_PASSWORD"
+          { printf '\\set db %s\n' "$DB"; cat <<'SQL'
+          SELECT format('DROP DATABASE IF EXISTS %I WITH (FORCE)', :'db') \gexec
+          SELECT format('DROP ROLE IF EXISTS %I', :'db') \gexec
+          SQL
+          } | docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
+                psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
+
+      - name: Mark the deployment inactive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVIRONMENT: ${{ steps.names.outputs.environment }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          gh_api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                       -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+          gh_api "$api/deployments?environment=$ENVIRONMENT&per_page=100" | jq -r '.[].id' | while read -r id; do
+            gh_api -X POST "$api/deployments/$id/statuses" -d '{"state":"inactive"}' >/dev/null
+          done
+          echo "Preview for PR #$PR_NUMBER removed" >> "$GITHUB_STEP_SUMMARY"
