@@ -90,9 +90,7 @@ jobs:
           # psql runs in a throwaway container next to the stack; the password goes in
           # through the environment and stdin, never on a command line.
           export PGPASSWORD="$PREVIEW_DB_ADMIN_PASSWORD"
-          printf '\\set db %s\n\\set pw %s\n' "$DB" "$pw" | cat - <<'SQL' | \
-            docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
-              psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
+          { printf '\\set db %s\n\\set pw %s\n' "$DB" "$pw"; cat <<'SQL'
           SELECT format('CREATE ROLE %I LOGIN IN ROLE preview_dbs', :'db')
             WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'db') \gexec
           SELECT format('ALTER ROLE %I CONNECTION LIMIT 10 PASSWORD %L', :'db', :'pw') \gexec
@@ -100,6 +98,8 @@ jobs:
             WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db') \gexec
           SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db') \gexec
           SQL
+          } | docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
+                psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
           echo "url=postgresql://${DB}:${pw}@${PREVIEW_DB_HOST}:${PREVIEW_DB_PORT}/${DB}" >> "$GITHUB_OUTPUT"
 
       - name: Build and start
@@ -178,12 +178,12 @@ jobs:
           set -euo pipefail
           : "${PREVIEW_DB_HOST:?the runner has no preview database settings}"
           export PGPASSWORD="$PREVIEW_DB_ADMIN_PASSWORD"
-          printf '\\set db %s\n' "$DB" | cat - <<'SQL' | \
-            docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
-              psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
+          { printf '\\set db %s\n' "$DB"; cat <<'SQL'
           SELECT format('DROP DATABASE IF EXISTS %I WITH (FORCE)', :'db') \gexec
           SELECT format('DROP ROLE IF EXISTS %I', :'db') \gexec
           SQL
+          } | docker run --rm -i -e PGPASSWORD docker.io/library/postgres:17-alpine \
+                psql -h "$PREVIEW_DB_HOST" -p "$PREVIEW_DB_PORT" -U "$PREVIEW_DB_ADMIN_USER" -d postgres -v ON_ERROR_STOP=1 -qAt
 
       - name: Mark the deployment inactive
         env:
