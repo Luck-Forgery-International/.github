@@ -1,5 +1,7 @@
 # Reusable: build one container image, push it to GHCR, and attest its build provenance.
 # App repos call this from their release.yml, once per image (e.g. web and api).
+# Always builds on a GitHub-hosted runner, from the release tag: promote-image.yml refuses
+# provenance signed on a self-hosted runner or from any other ref.
 # The image is pushed as ghcr.io/<org>/<repo>/<image>; deploy it by the digest this outputs.
 name: Release image
 
@@ -15,17 +17,13 @@ on:
         type: string
         required: true
       tag:
-        description: Human-readable tag, usually the release tag. Deployments use the digest, not this.
+        description: Release tag. Must be the tag this run is for. Deployments use the digest, not this.
         type: string
         required: true
       platforms:
-        description: Target platforms. The Pis are linux/arm64.
+        description: Target platforms. The build runner is natively linux/arm64.
         type: string
         default: linux/arm64
-      runner:
-        description: JSON for runs-on. Defaults to the UAT Pi 5 runner.
-        type: string
-        default: '["self-hosted", "uat"]'
     outputs:
       image:
         description: Full image name without tag.
@@ -39,7 +37,7 @@ permissions: {}
 jobs:
   build:
     name: Build ${{ inputs.image }}
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    runs-on: ubuntu-24.04-arm   # deliberately not an input
     timeout-minutes: 30
     permissions:
       contents: read
@@ -50,12 +48,21 @@ jobs:
       image: ${{ steps.build.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
+      - name: Check this run is for the release tag
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "Release tag is not a valid image tag" >&2; exit 1; }
+          [ "$IMAGE_TAG" != prod ] || { echo "The prod tag is set only by promote-image.yml" >&2; exit 1; }
+          [ "$GITHUB_REF" = "refs/tags/$IMAGE_TAG" ] || { echo "This run is for $GITHUB_REF, not tag $IMAGE_TAG" >&2; exit 1; }
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # The attest action reads registry credentials only from ~/.docker, so log in there
-      # and always log out at the end (matters on self-hosted runners).
+      # and always log out at the end.
       - name: Log in to GHCR
         env:
           REGISTRY_TOKEN: ${{ github.token }}
@@ -73,7 +80,7 @@ jobs:
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"; repo="${repo#.}"; repo="${repo,,}"
           image="ghcr.io/$owner/$repo/${IMAGE_NAME,,}"
-          tag="$(printf '%s' "$IMAGE_TAG" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-128)"
+          tag="$IMAGE_TAG"   # validated in the first step
 
           docker buildx build "$BUILD_CONTEXT" \
             --platform "$PLATFORMS" \
