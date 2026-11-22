@@ -12,7 +12,11 @@
 # The app's Compose file reads ${PREVIEW_PORT} (publish it on one service only) and
 # ${DATABASE_URL} (give it only to the service that needs the database). Every service
 # needs cpus, mem_limit, read_only and a non-root user; no host mounts, sockets,
-# privileges or host namespaces. The workflow refuses a file that breaks these rules.
+# privileges or host namespaces. Only the service holding the database URL may join a
+# network that reaches outside the Pi; every other service must sit only on networks
+# with internal: true, so it can't reach postgres-dev or the internet. (A host firewall
+# can't do this on the dev Pi: rootless Podman sends every container's traffic out as
+# the same user.) The workflow refuses a file that breaks these rules.
 # Images stay on the dev runner; nothing is pushed to a registry.
 #
 # The runner supplies PREVIEW_DB_HOST, PREVIEW_DB_PORT, PREVIEW_DB_ADMIN_USER and
@@ -82,7 +86,9 @@ jobs:
       - name: Check the preview Compose file
         # Refuse anything that could reach the host: sockets and host mounts, privileged
         # or extra capabilities, host namespaces, ports other than PREVIEW_PORT, missing
-        # CPU or memory limits, writable root filesystems. (Root users: after the build.)
+        # CPU or memory limits, writable root filesystems, and any service other than the
+        # one holding the database URL on a network that reaches outside the Pi.
+        # (Root users: after the build.)
         env:
           PREVIEW_PORT: ${{ steps.names.outputs.port }}
         run: |
@@ -93,7 +99,12 @@ jobs:
             docker compose -f "$COMPOSE_FILE_PATH" config --format json)"
           problems="$(jq -r --arg port "$PREVIEW_PORT" '
             def lim($a; $b): ($a // $b // null);
-            [ (.services // {} | to_entries[]) as {key: $n, value: $s}
+            # The service(s) given the database URL, found by its placeholder value, so a
+            # renamed variable (DB_URL: ${DATABASE_URL}) still counts.
+            def holds_db: (.environment // {}) | to_entries | map(.value // "" | tostring | contains("check@localhost/check")) | any;
+            . as $root
+            | [ .services // {} | to_entries[] | select(.value | holds_db) | .key ] as $dbsvc
+            | [ (.services // {} | to_entries[]) as {key: $n, value: $s}
               | ( ($s.volumes // [])[] | select(.type != "volume" and .type != "tmpfs")
                     | "\($n): mounts \(.source // .target) from the host (\(.type)); use a named volume or tmpfs" ),
                 ( select($s.privileged == true) | "\($n): privileged" ),
@@ -110,8 +121,16 @@ jobs:
                 ( select(lim($s.cpus; $s.deploy.resources.limits.cpus) == null) | "\($n): no CPU limit (set cpus)" ),
                 ( select(lim($s.mem_limit; $s.deploy.resources.limits.memory) == null) | "\($n): no memory limit (set mem_limit)" ),
                 ( ($s.ports // [])[] | select((.published // "" | tostring) != $port)
-                    | "\($n): publishes port \(.published // "random") (only ${PREVIEW_PORT} is allowed)" )
+                    | "\($n): publishes port \(.published // "random") (only ${PREVIEW_PORT} is allowed)" ),
+                ( select(($dbsvc | index($n)) == null)
+                    | ($s.networks // {"default": null} | keys[])
+                    | select(($root.networks[.].internal // false) != true)
+                    | "\($n): on network \(.), which reaches outside the Pi; only the service holding the database URL may (put \($n) only on networks with internal: true)" )
             ]
+            + ( if ($dbsvc | length) > 1 then ["more than one service holds the database URL: \($dbsvc | join(", ")); give it to the api only"] else [] end )
+            + [ (.networks // {}) | to_entries[]
+                | select((.value.external // false) or ((.value.driver // "bridge") != "bridge") or (.value.driver_opts != null))
+                | "network \(.key): external, custom driver or driver options (could join another stack or the host)" ]
             + ( [ .services // {} | to_entries[] | select((.value.ports // []) | length > 0) | .key ]
                 | if length > 1 then ["more than one service publishes a port: \(join(", "))"] else [] end )
             + [ (.volumes // {}) | to_entries[]
