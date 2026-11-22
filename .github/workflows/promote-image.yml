@@ -1,8 +1,9 @@
 # Reusable: approve one released image for production.
-#   1. verify: resolves the digest and checks it has build provenance signed by release-image.yml.
+#   1. verify: resolves the digest and checks it has build provenance signed by release-image.yml,
+#      on a GitHub-hosted runner, from this release tag.
 #   2. promote: waits for approval on the caller repo's `production` environment, then signs an
 #      "approved for prod" attestation for that digest and moves the :prod tag to it.
-# The prod Pi's pull agent only runs :prod if both attestations verify.
+# Deployers must check both attestations with --deny-self-hosted-runners before running :prod.
 name: Promote image
 
 on:
@@ -13,17 +14,13 @@ on:
         type: string
         required: true
       tag:
-        description: Release tag to promote. Ignored if digest is given.
+        description: Release tag to promote. The image's provenance must come from this tag.
         type: string
-        default: ''
+        required: true
       digest:
-        description: sha256 digest to promote.
+        description: sha256 digest to promote, if not the one the tag points to. Must still be built from that tag.
         type: string
         default: ''
-      runner:
-        description: JSON for runs-on.
-        type: string
-        default: '"ubuntu-latest"'
 
 permissions: {}
 
@@ -33,7 +30,7 @@ env:
 jobs:
   verify:
     name: Verify ${{ inputs.image }}
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    runs-on: ubuntu-latest   # deliberately not an input
     timeout-minutes: 10
     permissions:
       contents: read
@@ -70,11 +67,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ steps.resolve.outputs.image }}
           DIGEST: ${{ steps.resolve.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          [ -n "$RELEASE_TAG" ] || { echo "Give the release tag" >&2; exit 1; }
           gh attestation verify "oci://$IMAGE@$DIGEST" \
             --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY_OWNER/.github/.github/workflows/release-image.yml"
+            --signer-workflow "$GITHUB_REPOSITORY_OWNER/.github/.github/workflows/release-image.yml" \
+            --source-ref "refs/tags/$RELEASE_TAG" \
+            --deny-self-hosted-runners
           echo "Verified build provenance for \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of GHCR
@@ -84,7 +85,7 @@ jobs:
   promote:
     name: Approve ${{ inputs.image }} for prod
     needs: verify
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    runs-on: ubuntu-latest   # deliberately not an input
     environment: production   # pauses here until a required reviewer approves
     timeout-minutes: 10
     permissions:
@@ -98,9 +99,9 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.verify.outputs.image }}
           DIGEST: ${{ needs.verify.outputs.digest }}
-          # Release version, so the prod pull agent can refuse to roll back to a lower one.
-          # Empty when promoting by digest only.
-          VERSION: ${{ inputs.digest == '' && inputs.tag || '' }}
+          # Release version, so deployers can refuse to roll back to a lower one.
+          # The verify job has checked it against the tag in the signed provenance.
+          VERSION: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
